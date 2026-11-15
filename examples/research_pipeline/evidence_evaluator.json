@@ -1,0 +1,9 @@
+{
+  "id": "evidence_evaluator",
+  "version": "1.0.0",
+  "purpose": "Assess methodology and limitations of each paper",
+  "entrypoint": "research_services:evidence_evaluator",
+  "triggers": [{"kind": "event", "claim_type": "paper"}],
+  "reads": ["paper"],
+  "writes": ["evidence.assessment"]
+}

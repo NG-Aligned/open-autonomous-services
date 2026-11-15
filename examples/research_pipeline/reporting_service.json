@@ -1,0 +1,9 @@
+{
+  "id": "reporting_service",
+  "version": "1.0.0",
+  "purpose": "Maintain a current ranked evidence report",
+  "entrypoint": "research_services:reporting_service",
+  "triggers": [{"kind": "dependency", "service": "evidence_evaluator"}],
+  "reads": ["evidence.assessment"],
+  "writes": ["report"]
+}

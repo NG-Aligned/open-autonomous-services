@@ -1,0 +1,23 @@
+{
+  "id": "literature_monitor",
+  "version": "1.0.0",
+  "purpose": "Emit new papers from a configured feed as claims",
+  "entrypoint": "research_services:literature_monitor",
+  "config_schema": {
+    "papers": {"type": "list", "required": true},
+    "batch_size": {"type": "int", "default": 2}
+  },
+  "config": {
+    "papers": [
+      {"id": "p1", "title": "Drug A versus placebo", "design": "rct", "n": 1200},
+      {"id": "p2", "title": "Registry follow-up of drug A", "design": "cohort", "n": 800},
+      {"id": "p3", "title": "Retrospective matched study", "design": "case-control", "n": 150},
+      {"id": "p4", "title": "Single patient outcome", "design": "case-report", "n": 1},
+      {"id": "p5", "title": "Small pilot trial", "design": "rct", "n": 40}
+    ],
+    "batch_size": 2
+  },
+  "triggers": [{"kind": "interval", "seconds": 60}],
+  "writes": ["paper"],
+  "retry": {"max_attempts": 2, "backoff_seconds": 1}
+}
