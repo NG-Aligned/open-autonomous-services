@@ -15,7 +15,7 @@ Build history
 
 | Check | Result |
 |---|---|
-| Full test suite | **162 tests**, all passing (`python -m unittest discover -s tests`) |
+| Full test suite | **163 tests**, all passing (`python -m unittest discover -s tests`) |
 | Python versions | passes on 3.11, 3.12, 3.13 (Linux). 3.11 runs with 1 test skipped (see below) |
 | Resource hygiene | suite passes with `-W error::ResourceWarning` (no leaked database connections) |
 | Flakiness | concurrency suite passed 15 consecutive runs; isolation suite 12; transport suite 10 (and 8 more runs after the daemon tests were added); full suite 5 |
@@ -31,6 +31,9 @@ What each area was tested for (the requirement to test map is in `ARCHITECTURE.m
 - **Claim schemas**: validator keywords and every violation kind; malformed schemas rejected; enforced on write
   (audited, nothing committed) and on import (against schemas declared by local services); `validate()` warns when
   services disagree about a type's schema.
+- **Trust flow demo** (`examples/trust_flow.sh`, the README headline): a test runs it and checks the three outcomes
+  (nobody trusted: 0/5 imported; trusted for two of three services: 4/5; altered claims from a fully trusted key:
+  rejected) and that the README transcript still matches.
 - **Signed claims**: local claims signed at commit; signature covers the claim id *and* origin; altered origin,
   swapped, garbage and half-present signatures rejected on import; unsigned claims accepted by default and
   rejected under `--require-signatures`; trusted-signer policy limits which services a key may vouch for;

@@ -6,6 +6,27 @@ The unit of development is the *capability*, not the application. Each service d
 manifest, keeps its own persistent state, and cooperates with other services only through **claims** — typed
 records that carry their origin, inputs, confidence and history. An application is an arrangement of services.
 
+## What makes this different: nodes that don't have to trust each other
+
+Independent nodes exchange claims without any central authority, and each node decides, per signing key and per
+service name, what it will accept. [`examples/trust_flow.sh`](examples/trust_flow.sh) runs this for real (output
+below is from that script; a test runs it on every change):
+
+```
+node A signed claims with key e5fc91dd703b8d55...
+1. B imports with no trusted signers:
+   imported 0 | rejected 5 | signer e5fc91dd703b is not trusted
+2. B trusts A for literature_* and evidence_* only (not reporting_service):
+   imported 4 | rejected 1 | signer e5fc91dd703b is not trusted for service 'reporting_service'
+3. C trusts A for everything, but receives a bundle with one field altered in transit:
+   imported 3 | rejected 2 | signature does not verify (forged or altered claim/origin)
+```
+
+What this demonstrates: a trusted key cannot vouch for services it was not granted, and any alteration (even of a
+field the claim id does not cover, like its origin) is caught by the signature. What it does **not** claim: that
+signed content is *true*, that keys can be rotated or revoked (not built yet), or that the code has had an
+independent security review (it has not). See [docs/STATUS.md](docs/STATUS.md).
+
 - **No central dependency.** Python standard library + SQLite. A node is one file. Nodes exchange verifiable
   claim bundles as plain files; nothing requires a server, a broker, or a particular host.
 - **Standard contract.** Purpose, configuration, state, triggers, execution, output and continuity are declared

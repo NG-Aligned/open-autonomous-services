@@ -210,3 +210,22 @@ class SignedCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrustFlowScriptTests(unittest.TestCase):
+    """The README's headline demo (examples/trust_flow.sh) must keep producing the documented outcomes."""
+
+    def test_script_outputs_match_the_readme(self):
+        script = os.path.join(ROOT, "examples", "trust_flow.sh")
+        p = subprocess.run(["bash", script], capture_output=True, text=True, timeout=120,
+                           env=dict(os.environ, PYTHONPATH=ROOT))
+        self.assertEqual(p.returncode, 0, msg=p.stderr)
+        out = p.stdout
+        self.assertIn("imported 0 | rejected 5 | signer", out)
+        self.assertIn("imported 4 | rejected 1 | signer", out)
+        self.assertIn("not trusted for service 'reporting_service'", out)
+        self.assertIn("imported 3 | rejected 2 | signature does not verify", out)
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        for line in ("imported 0 | rejected 5 |", "imported 4 | rejected 1 |", "imported 3 | rejected 2 |"):
+            self.assertIn(line, readme)                       # the README transcript has not drifted from the script
