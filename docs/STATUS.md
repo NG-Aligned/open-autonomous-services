@@ -7,19 +7,12 @@ and passed. Everything else is listed under "Not verified" or "Not implemented".
 
 ## Publication
 
-**Not published to GitHub.** Publishing to `https://github.com/NG-Aligned/open-autonomous-services` was attempted
-at the start of the window and failed: the session could not attach the repository because GitHub is not linked
-to the Claude account, and the sandbox's own GitHub CLI token was invalid. Nothing was pushed anywhere.
+**Published** at <https://github.com/NG-Aligned/open-autonomous-services> (branch `main`).
 
-The directory is a ready-to-push git repository (one commit on `main`). To publish it yourself:
-
-```bash
-git remote add origin https://github.com/NG-Aligned/open-autonomous-services.git
-git push -u origin main
-```
-
-(These two commands are standard git; they were not run here.) The commit author is a neutral placeholder; re-author
-it if you want your own name on it (`git commit --amend --reset-author`).
+Publication happened on 2026-11-16, *after* the 60-minute build window had closed (the code was complete and
+verified at about 23:59 UTC on 2026-11-15). It was delayed only because the build session lacked write access to
+the GitHub organisation until the Claude GitHub App was installed. No code changed between the verification
+below and the push; a fresh clone of the published repository was re-tested afterwards and all 91 tests passed.
 
 The `LICENSE` file is the Apache-2.0 text copied from a license file available in the build environment
 (201 lines, headed "Apache License, Version 2.0, January 2004"). Please compare it with
@@ -76,7 +69,7 @@ Capability-level results (see the requirement → test table in `ARCHITECTURE.md
 | Error handling | Done |
 | Orchestration | Done (derived graph, bounded cascading, leases) |
 | Open, documented, modular | Done (README, ARCHITECTURE, this file; Apache-2.0) |
-| Published | **Not done** (see above) |
+| Published | Done (after the window; see Publication) |
 
 ## Known limitations (please read)
 
