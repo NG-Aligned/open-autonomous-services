@@ -38,7 +38,9 @@ A claim has: `type`, `content` (any JSON), `source_service`, `inputs` (claim ids
   created_at, supersedes)`. Anyone can recompute it, so a claim's integrity can be verified without a
   central authority. Identical claims deduplicate (writes are idempotent).
 - **History.** A claim is *current* unless another claim supersedes it. A service may supersede only its own
-  claims, of the same type, once (linear history).
+  claims, of the same type, once (linear history). A supersession only counts when the superseding claim has the
+  **same source service, origin and type** as its target; otherwise it is ignored everywhere (current view,
+  lineage, pruning). This stops a peer hiding someone else's claim by naming it in `supersedes` before it arrives.
 - **Lineage.** `Store.lineage(id)` walks `inputs` and `supersedes` back to the roots and reports any ancestors
   that are not present locally (e.g. after a partial import).
 - **Confidence is a number the service supplies.** The framework stores and propagates it but does not
@@ -64,8 +66,9 @@ together with the run record, trigger cursors and next-due time — in **one SQL
 
 - **Retries** with exponential backoff (`retry.max_attempts`, `retry.backoff_seconds` × 2^(n-1)). State from a
   failed attempt is discarded.
-- **Timeouts.** The function runs in a worker thread; on timeout the run fails and the context is cancelled so a
-  late write can never commit. (The thread itself cannot be killed — see STATUS.)
+- **Timeouts.** In thread mode the function runs in a worker thread; on timeout the run fails and the context is
+  cancelled so a late write can never commit, but the thread itself cannot be killed. With
+  `isolation: "process"` (section 13) a timeout kills the process.
 - **Circuit breaker.** After `circuit_breaker` consecutive failed runs the service is disabled with a recorded
   reason; `enable` re-enables it. Registering a new version also re-enables it.
 - **Execution lease.** Before running, an orchestrator atomically takes a per-service lease (default 300 s). A
@@ -77,6 +80,7 @@ together with the run record, trigger cursors and next-due time — in **one SQL
 
 | Trigger | Fires when | Cursor |
 |---|---|---|
+| `cron` (`expr`, 5 fields, UTC) | the next matching minute after the last consumed slot has passed; missed slots coalesce into one run; a failed slot is consumed (no hot retry) | `cron:<expr>` cursor (next slot) |
 | `interval` (seconds) | `next_due ≤ now` (first tick runs immediately) | `next_due`, advanced after every completed run, failed or not |
 | `event` (`claim_type`, wildcards ok) | new claims of that type since the last successful run, **excluding the service's own local writes** | per-trigger claim sequence |
 | `dependency` (`service`) | that service has a successful run newer than the last one seen | run sequence |
@@ -106,8 +110,9 @@ answer "who writes/reads this claim type" from manifests alone.
 - refuses a foreign claim that tries to supersede a claim owned by a different service/origin;
 - imported claims trigger local `event` services exactly like local ones.
 
-This gives integrity, **not authenticity**: there are no signatures yet, so `source_service` and `origin` are
-self-asserted.
+Integrity comes from the content-addressed ids; **authenticity comes from signatures** (section 12). Unsigned claims
+are accepted unless the importer requires signatures, in which case `source_service` and `origin` are only as
+trustworthy as the signing key's trust policy.
 
 ## 9. Requirement → code → tests
 
@@ -125,9 +130,62 @@ self-asserted.
 | Error handling | retries, timeout, breaker, rollback | `test_executor.py`, `test_robustness.py` |
 | Orchestration | `graph.py`, `tick`, `validate` | `test_scheduler.py`, `test_pipeline.py` |
 | Concurrency safety | execution leases | `test_concurrency.py`, `test_robustness.py::CrashSafety` |
-| No central dependency | file-based nodes, `federation.py` | `test_federation.py`, `test_cli.py` (two-node exchange) |
+| No central dependency | file-based nodes, `federation.py`, `transport.py` | `test_federation.py`, `test_cli.py`, `test_transport.py` |
+| Semantic contracts | `schema.py`, `claim_schemas` | `test_schema.py` |
+| Authenticity and trust | `ed25519.py`, signatures, trusted signers | `test_signing.py` |
+| Killable, contained services | `isolation.py` | `test_isolation.py`, `test_regressions.py` |
+| Calendar schedules | `cron.py` | `test_cron.py` |
+| Retention | `Store.prune_*` | `test_retention.py` |
+| Hostile-input handling | import/sync containment, supersession rule | `test_regressions.py` |
 
-## 10. Extending
+## 10. Claim schemas (`oas/schema.py`)
+
+A manifest may declare `claim_schemas: {claim_type: schema}` for types it reads or writes (keys may be wildcards).
+The schema language is a JSON-Schema subset (type, enum, const, properties, required, additionalProperties,
+items, min/max Items/Length, minimum/maximum); unknown keywords are rejected so a typo cannot silently disable
+validation. Schemas are checked when a service writes (violations fail the run and are audited), when a bundle is
+imported (against schemas declared by *any locally registered service* for that type), and `validate()` warns when
+services declare different schemas for the same type. A type nobody declares a schema for is unvalidated.
+
+## 11. Cron triggers (`oas/cron.py`)
+
+`{"kind": "cron", "expr": "0 9 * * 1-5"}`: five numeric fields, UTC, lists/ranges/steps, classic day-of-month OR
+day-of-week rule. The framework has no scheduler loop of its own: something must call `tick()` (a loop, systemd
+timer, cron job); due cron slots are evaluated at that moment.
+
+## 12. Signed claims and trust (`oas/ed25519.py`, `oas/store.py`, `oas/federation.py`)
+
+Every node has an Ed25519 key (stored in its database, never exported). Claims written locally are signed at
+commit. The signature covers `"oas-claim/1:" + claim_id + ":" + origin`: the id commits to type, content, source
+service, inputs, confidence, time and supersession, and the origin is added because the id does not cover it.
+On import a present signature must verify; `--require-signatures` rejects unsigned claims; `--require-trusted`
+additionally requires the signer's key to be registered (`oas trust add <pubkey> --label L --service PATTERN ...`)
+**and** the claim's `source_service` to match that key's allowed patterns, so a trusted key cannot vouch for
+services it was not granted. Signatures survive relaying (A to B to C). Ed25519 is a pure-Python implementation
+(RFC 8032 vectors verified); see STATUS for its limits.
+
+## 13. Process isolation (`oas/isolation.py`)
+
+`"isolation": "process"` (requires an `entrypoint`, optional `max_memory_mb`) runs the service in a child
+interpreter. The child has no database handle: each context call is a JSON-lines RPC over a socketpair to the
+parent, which runs it on the real permission-checked `ServiceContext`. The parent enforces the timeout by killing
+the child, contains crashes and memory exhaustion, and commits the run atomically as usual. This isolates
+failures, not a malicious same-user process (see STATUS).
+
+## 14. Transports (`oas/transport.py`)
+
+- **Directory sync** (`oas sync DIR`): each node atomically writes `<node_id>.bundle.json` and imports everyone
+  else's. The directory can be a git repo, Syncthing folder, network share or USB stick.
+- **HTTP** (`oas serve` / `oas pull URL`): read-only `GET /bundle?since=N&type=T` and `GET /whoami`. No auth or TLS.
+Both go through `import_bundle`, so schemas, signatures and trust policy apply identically.
+
+## 15. Retention (`oas/store.py`)
+
+`prune_runs` (keeps the newest N per service plus the latest success), `prune_audit`, `prune_messages` (consumed
+only) and `prune_superseded_claims` (never current claims; later lineage reports the gap). Nothing runs
+automatically (`oas prune ...`).
+
+## 16. Extending
 
 - **New service:** write a function `fn(ctx)` and a manifest; register with `Orchestrator.register` or drop the
   manifest in a directory and `discover` it.

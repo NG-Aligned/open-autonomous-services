@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .errors import ClaimError
-from .store import Claim, Store, compute_claim_id
+from . import schema as _schema
+from .manifest import matches
+from .store import Claim, Store, compute_claim_id, verify_wire_signature
 
 BUNDLE_FORMAT = "oas-bundle/1"
 _REQUIRED = ("id", "type", "content", "source_service", "inputs", "confidence",
@@ -24,6 +26,7 @@ def export_bundle(store: Store, types: list[str] | None = None, since_seq: int =
         "format": BUNDLE_FORMAT,
         "node_id": store.node_id,
         "exported_at": store.clock(),
+        "signer": store.public_key,
         "claims": [c.to_wire() for c in claims],
     }
 
@@ -53,8 +56,19 @@ def _validate_shape(w: Any) -> None:
         raise ClaimError("supersedes must be a string or null")
 
 
-def import_bundle(store: Store, bundle: dict[str, Any]) -> dict[str, Any]:
-    """Verify and merge a bundle. Idempotent. Returns counts plus per-claim rejection reasons."""
+def import_bundle(store: Store, bundle: dict[str, Any], *,
+                  schema_lookup: Callable[[str], list[dict[str, Any]]] | None = None,
+                  trusted: dict[str, dict[str, Any]] | None = None,
+                  require_signatures: bool = False) -> dict[str, Any]:
+    """Verify and merge a bundle. Idempotent. Returns counts plus per-claim rejection reasons.
+
+    `schema_lookup(claim_type)` returns the schemas locally registered services declare for that type;
+    claims whose content violates any of them are rejected.
+
+    Signatures: a present signature must verify (covering the id and origin) or the claim is rejected. With
+    `require_signatures`, unsigned claims are rejected. With `trusted` (pubkey -> {"services": [patterns]}), the
+    signer must be listed and the claim's source_service must match one of its patterns.
+    """
     if not isinstance(bundle, dict) or bundle.get("format") != BUNDLE_FORMAT:
         raise ClaimError(f"unsupported bundle format (expected {BUNDLE_FORMAT})")
     claims = bundle.get("claims")
@@ -62,6 +76,17 @@ def import_bundle(store: Store, bundle: dict[str, Any]) -> dict[str, Any]:
         raise ClaimError("bundle has no claims list")
     imported = duplicates = 0
     rejected: list[dict[str, str]] = []
+    with store.transaction():
+        imported, duplicates = _import_claims(store, claims, rejected, schema_lookup, trusted, require_signatures)
+    store.audit(None, "import_bundle",
+                f"from {bundle.get('node_id')}: {imported} imported, {duplicates} duplicate, {len(rejected)} rejected",
+                True)
+    return {"imported": imported, "duplicates": duplicates, "rejected": rejected}
+
+
+def _import_claims(store: Store, claims: list[Any], rejected: list[dict[str, str]],
+                   schema_lookup, trusted, require_signatures) -> tuple[int, int]:
+    imported = duplicates = 0
     for w in claims:
         cid = w.get("id", "?") if isinstance(w, dict) else "?"
         try:
@@ -73,6 +98,22 @@ def import_bundle(store: Store, bundle: dict[str, Any]) -> dict[str, Any]:
             if store.get_claim(w["id"]) is not None:
                 duplicates += 1
                 continue
+            status = verify_wire_signature(w)
+            if status == "invalid":
+                raise ClaimError("signature does not verify (forged or altered claim/origin)")
+            if status == "unsigned" and (require_signatures or trusted is not None):
+                raise ClaimError("claim is unsigned but signatures are required")
+            if trusted is not None:
+                entry = trusted.get(w["signer"])
+                if entry is None:
+                    raise ClaimError(f"signer {w['signer'][:12]} is not trusted")
+                if not matches(entry["services"], w["source_service"]):
+                    raise ClaimError(f"signer {w['signer'][:12]} is not trusted for service '{w['source_service']}'")
+            if schema_lookup is not None:
+                for sch in schema_lookup(w["type"]):
+                    problems = _schema.validate(w["content"], sch)
+                    if problems:
+                        raise ClaimError(f"content violates local schema for '{w['type']}': {problems[0]}")
             if w["origin"] == store.node_id:
                 raise ClaimError("claims claiming this node as origin must already exist locally")
             if w["supersedes"]:
@@ -80,15 +121,15 @@ def import_bundle(store: Store, bundle: dict[str, Any]) -> dict[str, Any]:
                 if target is not None and (target.source_service != w["source_service"]
                                            or target.origin != w["origin"]):
                     raise ClaimError("cannot supersede a claim owned by a different service/origin")
+                if target is not None and target.type != w["type"]:
+                    raise ClaimError("a claim may only supersede a claim of the same type")
             claim = Claim(id=w["id"], type=w["type"], content=w["content"],
                           source_service=w["source_service"], inputs=tuple(w["inputs"]),
                           confidence=float(w["confidence"]), created_at=float(w["created_at"]),
-                          supersedes=w["supersedes"], origin=w["origin"])
+                          supersedes=w["supersedes"], origin=w["origin"],
+                          signer=w.get("signer"), signature=w.get("signature"))
             if store.insert_claim(claim):
                 imported += 1
         except ClaimError as exc:
             rejected.append({"id": str(cid), "reason": str(exc)})
-    store.audit(None, "import_bundle",
-                f"from {bundle.get('node_id')}: {imported} imported, {duplicates} duplicate, {len(rejected)} rejected",
-                True)
-    return {"imported": imported, "duplicates": duplicates, "rejected": rejected}
+    return imported, duplicates

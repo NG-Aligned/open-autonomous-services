@@ -108,3 +108,34 @@ class StoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QueryPushdownTests(unittest.TestCase):
+    """query_claims filters/limits in SQL; results must equal the pure-Python (fnmatch) semantics."""
+
+    def setUp(self):
+        self.store = Store(":memory:", clock=FakeClock())
+        self.addCleanup(self.store.close)
+        for i, t in enumerate(["paper", "paper.new", "paper.old", "report", "a1", "a2", "ab", "misc.x.y"]):
+            mk(self.store, type=t, content={"i": i}, source=t, t=float(i))
+
+    def types(self, pats, **kw):
+        return [c.type for c in self.store.query_claims(pats, **kw)]
+
+    def test_literal_wildcard_and_class_patterns_match_fnmatch_semantics(self):
+        import fnmatch
+        all_types = [c.type for c in self.store.query_claims()]
+        for pats in (["paper"], ["paper.*"], ["pap?r*"], ["a?"], ["a[12]"], ["a[!1]"], ["*"], ["paper", "report"],
+                     ["misc.*.y"], ["paper.*", "a[12]"], ["nothing"]):
+            expected = [t for t in all_types if any(fnmatch.fnmatchcase(t, p) for p in pats)]
+            self.assertEqual(self.types(pats), expected, msg=str(pats))
+
+    def test_limit_pushed_down_and_with_class_pattern(self):
+        self.assertEqual(self.types(["paper.*"], limit=1), ["paper.new"])
+        self.assertEqual(self.types(["a[12]"], limit=1), ["a1"])
+        self.assertEqual(len(self.store.query_claims(limit=3)), 3)
+
+    def test_class_pattern_does_not_clobber_other_filters(self):
+        # source_service equals a type name: a naive param filter would drop it
+        self.assertEqual(self.types(["a[12]"], source_service="a1"), ["a1"])
+        self.assertEqual(self.types(["a[12]"], after_seq=5), ["a2"])

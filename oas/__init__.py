@@ -8,7 +8,7 @@ from .manifest import Manifest, load_manifest
 from .orchestrator import Orchestrator, RunResult, TickResult
 from .store import Claim, Store, compute_claim_id
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "Claim", "ClaimError", "Manifest", "ManifestError", "MessageError", "OASError", "Orchestrator",
     "PermissionDenied", "RunResult", "ServiceCancelled", "ServiceContext", "ServiceDisabled",

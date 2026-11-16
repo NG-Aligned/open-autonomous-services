@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 from .errors import ClaimError, MessageError, PermissionDenied, ServiceCancelled
 from .manifest import Manifest, has_wildcard, matches
+from . import schema as _schema
 from .store import Claim, Store, compute_claim_id
 
 MAX_LOG_LINES = 200
@@ -90,6 +91,11 @@ class ServiceContext:
         if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0.0 <= confidence <= 1.0:
             raise ClaimError("confidence must be a number between 0 and 1")
         content = _jsonable(content, "claim content")
+        for sch in self._manifest.schemas_for(claim_type):
+            problems = _schema.validate(content, sch)
+            if problems:
+                self._store.audit(self.service_id, "schema_violation", f"{claim_type}: {problems[0]}", False)
+                raise ClaimError(f"content of '{claim_type}' violates its schema: {problems[0]}")
         input_ids = tuple(sorted(set(inputs)))
         for cid in input_ids:
             cited = self._lookup(cid)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-autonomous-services"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small decentralised framework for independently configured, cooperating autonomous services."
 readme = "README.md"
 requires-python = ">=3.11"

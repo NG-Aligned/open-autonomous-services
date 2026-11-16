@@ -9,10 +9,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from . import cron as _cron
 from .errors import ManifestError
+from .schema import check_schema
 
 ID_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
-TRIGGER_KINDS = ("interval", "event", "dependency", "message", "manual")
+TRIGGER_KINDS = ("interval", "cron", "event", "dependency", "message", "manual")
 CONTINUITY_MODES = ("persist", "ephemeral")
 CONFIG_TYPES: dict[str, Any] = {
     "str": str,
@@ -25,7 +27,8 @@ CONFIG_TYPES: dict[str, Any] = {
 ALLOWED_KEYS = {
     "id", "version", "purpose", "entrypoint", "config", "config_schema",
     "triggers", "reads", "writes", "can_message", "retry",
-    "timeout_seconds", "continuity", "circuit_breaker",
+    "timeout_seconds", "continuity", "circuit_breaker", "claim_schemas", "isolation",
+    "max_memory_mb",
 }
 
 
@@ -57,6 +60,9 @@ class Manifest:
     timeout_seconds: float | None = None
     continuity: str = "persist"
     circuit_breaker: int = 3
+    claim_schemas: dict[str, Any] = field(default_factory=dict)
+    isolation: str = "thread"
+    max_memory_mb: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Manifest":
@@ -84,7 +90,7 @@ class Manifest:
             not isinstance(self.entrypoint, str) or ":" not in self.entrypoint
         ):
             raise ManifestError("entrypoint must look like 'module:function'")
-        for name in ("config", "config_schema", "retry"):
+        for name in ("config", "config_schema", "retry", "claim_schemas"):
             if not isinstance(getattr(self, name), dict):
                 raise ManifestError(f"'{name}' must be an object")
         for name in ("reads", "writes", "can_message", "triggers"):
@@ -116,7 +122,30 @@ class Manifest:
             raise ManifestError(f"continuity must be one of {CONTINUITY_MODES}")
         if not isinstance(self.circuit_breaker, int) or isinstance(self.circuit_breaker, bool) or self.circuit_breaker < 1:
             raise ManifestError("circuit_breaker must be an integer >= 1")
+        if self.isolation not in ("thread", "process"):
+            raise ManifestError("isolation must be 'thread' or 'process'")
+        if self.isolation == "process" and not self.entrypoint:
+            raise ManifestError("isolation 'process' requires an entrypoint ('module:function')")
+        if self.max_memory_mb is not None and (not isinstance(self.max_memory_mb, int)
+                                               or isinstance(self.max_memory_mb, bool) or self.max_memory_mb < 16):
+            raise ManifestError("max_memory_mb must be an integer >= 16 or null")
+        if self.max_memory_mb is not None and self.isolation != "process":
+            raise ManifestError("max_memory_mb only applies with isolation 'process'")
+        for ctype, schema in self.claim_schemas.items():
+            if not isinstance(ctype, str) or not ctype:
+                raise ManifestError("claim_schemas keys must be non-empty claim type strings")
+            if not (matches(self.writes, ctype) or matches(self.reads, ctype)
+                    or ctype in self.writes or ctype in self.reads):
+                raise ManifestError(f"claim_schemas['{ctype}'] is for a type this service neither reads nor writes")
+            problems = check_schema(schema)
+            if problems:
+                raise ManifestError(f"claim_schemas['{ctype}'] invalid: {problems[0]}")
         self.resolve_config()
+
+    def schemas_for(self, claim_type: str) -> list[dict[str, Any]]:
+        """Schemas declared by this manifest that apply to a literal claim type (exact key or wildcard key)."""
+        return [sch for key, sch in self.claim_schemas.items()
+                if key == claim_type or fnmatch.fnmatchcase(claim_type, key)]
 
     @staticmethod
     def _validate_trigger(t: Any) -> None:
@@ -126,6 +155,11 @@ class Manifest:
         if kind == "interval":
             if not _is_number(t.get("seconds")) or t["seconds"] <= 0:
                 raise ManifestError("interval trigger needs positive 'seconds'")
+        elif kind == "cron":
+            try:
+                _cron.next_fire(t.get("expr"), 0.0)
+            except ValueError as exc:
+                raise ManifestError(f"cron trigger invalid: {exc}") from None
         elif kind == "event":
             if not isinstance(t.get("claim_type"), str) or not t["claim_type"]:
                 raise ManifestError("event trigger needs 'claim_type'")

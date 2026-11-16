@@ -19,6 +19,9 @@ from typing import Any, Callable
 from .context import ServiceContext
 from .errors import (ManifestError, ServiceDisabled, ServiceNotBound, ServiceNotFound,
                      ServiceTimeout)
+from . import cron as _cron
+from .isolation import run_in_process
+from .federation import import_bundle as _import_bundle
 from .graph import build_edges, find_cycles, topo_order, types_overlap
 from .manifest import Manifest, load_manifest, matches
 from .store import Store
@@ -124,6 +127,24 @@ class Orchestrator:
     def _manifests(self) -> dict[str, Manifest]:
         return {s["id"]: Manifest.from_dict(s["manifest"]) for s in self.store.list_services()}
 
+    def schemas_for(self, claim_type: str) -> list[dict[str, Any]]:
+        """All schemas any registered service declares for a literal claim type."""
+        out: list[dict[str, Any]] = []
+        for m in self._manifests().values():
+            out += m.schemas_for(claim_type)
+        return out
+
+    def import_bundle(self, bundle: dict[str, Any], *, require_trusted: bool = False,
+                      require_signatures: bool = False) -> dict[str, Any]:
+        """Import a bundle: integrity, signatures, local schemas and (optionally) the trusted-signer policy.
+
+        With require_trusted, every claim must be signed by a key registered via Store.add_trusted_signer whose
+        allowed service patterns match the claim's source_service.
+        """
+        return _import_bundle(self.store, bundle, schema_lookup=self.schemas_for,
+                              trusted=self.store.trusted_signers() if require_trusted else None,
+                              require_signatures=require_signatures or require_trusted)
+
     def find_providers(self, claim_type: str) -> list[str]:
         return sorted(i for i, m in self._manifests().items()
                       if any(types_overlap(w, claim_type) for w in m.writes))
@@ -166,6 +187,15 @@ class Orchestrator:
                 if not any(matches([target], other) for other in ms):
                     issues.append({"level": "warning", "service": m.id,
                                    "message": f"can_message target '{target}' matches no registered service"})
+        by_type: dict[str, list[tuple[str, str]]] = {}
+        for m in ms.values():
+            for ctype, sch in m.claim_schemas.items():
+                by_type.setdefault(ctype, []).append((m.id, json.dumps(sch, sort_keys=True)))
+        for ctype, decls in sorted(by_type.items()):
+            if len({d[1] for d in decls}) > 1:
+                who = ",".join(sorted({d[0] for d in decls}))
+                issues.append({"level": "warning", "service": who,
+                               "message": f"services declare different schemas for claim type '{ctype}'"})
         for cyc in self.graph()["cycles"]:
             issues.append({"level": "warning", "service": ",".join(cyc),
                            "message": "dependency cycle; execution is bounded by max_rounds"})
@@ -190,6 +220,14 @@ class Orchestrator:
             if kind == "interval":
                 if svc["next_due"] <= now:
                     reasons.append({"kind": "interval", "seconds": t["seconds"]})
+            elif kind == "cron":
+                key = f"cron:{t['expr']}"
+                nxt = cursors.get(key)
+                if nxt is None:                      # first evaluation: next fire after registration
+                    nxt = _cron.next_fire(t["expr"], svc["registered_at"])
+                if nxt <= now:                       # missed firings (downtime) coalesce into one run
+                    reasons.append({"kind": "cron", "expr": t["expr"], "scheduled_for": nxt})
+                    updates[key] = _cron.next_fire(t["expr"], now)
             elif kind == "event":
                 key = f"event:{t['claim_type']}"
                 new = self.store.query_claims([t["claim_type"]], current_only=False,
@@ -284,10 +322,14 @@ class Orchestrator:
             ctx: ServiceContext | None = None
             try:
                 config = manifest.resolve_config()
-                fn = self._resolve_fn(service_id, manifest, svc["base_dir"])
                 state = {} if manifest.continuity == "ephemeral" else self.store.get_state(service_id)
                 ctx = ServiceContext(self.store, manifest, config, json.loads(json.dumps(state)), reasons, run_id)
-                self._call(fn, ctx, manifest.timeout_seconds)
+                if manifest.isolation == "process":
+                    run_in_process(ctx, manifest.entrypoint, svc["base_dir"], manifest.timeout_seconds,
+                                   manifest.max_memory_mb)
+                else:
+                    fn = self._resolve_fn(service_id, manifest, svc["base_dir"])
+                    self._call(fn, ctx, manifest.timeout_seconds)
                 written = self._commit(ctx, manifest, svc, cursor_updates or {}, interval, started, attempt, reasons)
             except Exception as exc:  # noqa: BLE001 - every service failure is contained here
                 if ctx is not None:
@@ -303,7 +345,7 @@ class Orchestrator:
                 continue
             return RunResult(service_id, "success", attempt, run_id, written, None, list(ctx._logs))
         return self._record_exhausted(service_id, manifest, svc, interval, max_attempts, run_id,
-                                      last_error or "unknown error", last_logs)
+                                      last_error or "unknown error", last_logs, cursor_updates or {})
 
     def _commit(self, ctx: ServiceContext, manifest: Manifest, svc: dict[str, Any],
                 cursor_updates: dict[str, Any], interval: float | None, started: float,
@@ -312,7 +354,7 @@ class Orchestrator:
         written = 0
         with self.store.transaction():
             for claim in ctx._pending:
-                if self.store.insert_claim(claim):
+                if self.store.insert_claim(self.store.sign_claim(claim) if self.store.sign else claim):
                     written += 1
             self.store.set_state(manifest.id, ctx.state if manifest.continuity == "persist" else {})
             for to, topic, payload in ctx._outgoing:
@@ -331,12 +373,15 @@ class Orchestrator:
 
     def _record_exhausted(self, service_id: str, manifest: Manifest, svc: dict[str, Any],
                           interval: float | None, attempts: int, run_id: str, error: str,
-                          logs: list[str]) -> RunResult:
+                          logs: list[str], cursor_updates: dict[str, Any]) -> RunResult:
         fresh = self._require(service_id)
         failures = fresh["consecutive_failures"] + 1
         fields: dict[str, Any] = {"consecutive_failures": failures}
         if interval is not None:
             fields["next_due"] = self.clock() + interval
+        cron_updates = {k: v for k, v in cursor_updates.items() if k.startswith("cron:")}
+        if cron_updates:                 # a failed scheduled slot is consumed (like interval): no hot retry loop
+            fields["cursors"] = {**fresh["cursors"], **cron_updates}
         self.store.update_service(service_id, **fields)
         if failures >= manifest.circuit_breaker:
             reason = f"circuit breaker: {failures} consecutive failures; last error: {error}"

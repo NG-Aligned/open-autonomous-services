@@ -14,12 +14,17 @@ records that carry their origin, inputs, confidence and history. An application 
   service, the claims it was derived from, its confidence and what it supersedes.
 - **Enforced permissions.** Services can only read, write, cite and message what their manifest declares.
   Denials are audited.
+- **Signed, schema-checked claims.** Claims are Ed25519-signed; importers can require signatures and restrict which
+  keys may vouch for which services. Services may declare JSON-Schema-subset contracts for claim content.
 - **Safe execution.** Each run commits atomically (claims + state + messages + cursors), with retries,
-  exponential backoff, timeouts, a circuit breaker and execution leases.
+  exponential backoff, timeouts, a circuit breaker and execution leases. Optional process isolation makes
+  timeouts kill the service and contains crashes and memory use.
+- **Schedules.** Interval, cron (UTC), event, dependency and message triggers.
+- **Decentralised exchange.** Share claims through a synced directory (git, Syncthing, USB) or read-only HTTP.
 - **Orchestration without central intelligence.** Execution order is derived from the manifests' declared
   reads/writes; the orchestrator only coordinates.
 
-> Status: **v0.1.0**, built in a strict 60-minute window. See [docs/STATUS.md](docs/STATUS.md) for exactly what
+> Status: **v0.2.0**, built within a 60-minute work budget. See [docs/STATUS.md](docs/STATUS.md) for exactly what
 > was verified, what was not, and the known limitations. Please read it before relying on this.
 
 ## Quick start
@@ -34,6 +39,11 @@ oas --db demo.db claims --type report
 oas --db demo.db lineage <claim-id>         # full provenance ancestry of a claim
 oas --db demo.db graph                      # dependency graph, execution order, cycles
 oas --db demo.db export bundle.json         # share verified claims with another node
+oas --db demo.db whoami                     # this node's id and public signing key
+oas --db other.db trust add <pubkey> --label demo --service 'literature_*'
+oas --db other.db import bundle.json --require-trusted    # only accept claims signed by trusted keys
+oas --db demo.db sync ./shared              # or: exchange through a shared directory
+oas --db demo.db prune --keep-runs 50       # retention
 ```
 
 Writing a service:
@@ -65,6 +75,7 @@ Or declare the service in a JSON/TOML manifest with `"entrypoint": "module:funct
 
 ```bash
 python -m unittest discover -s tests
+python benchmarks/bench.py 20000          # measure on your machine
 ```
 
 ## Documentation
