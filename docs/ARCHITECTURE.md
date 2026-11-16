@@ -150,8 +150,8 @@ services declare different schemas for the same type. A type nobody declares a s
 ## 11. Cron triggers (`oas/cron.py`)
 
 `{"kind": "cron", "expr": "0 9 * * 1-5"}`: five numeric fields, UTC, lists/ranges/steps, classic day-of-month OR
-day-of-week rule. The framework has no scheduler loop of its own: something must call `tick()` (a loop, systemd
-timer, cron job); due cron slots are evaluated at that moment.
+day-of-week rule. `oas daemon [--interval N]` is a minimal loop that calls `tick()` and shuts down cleanly on SIGINT/SIGTERM; you can
+equally call `tick()` yourself (systemd timer, cron job). Due cron slots are evaluated at tick time.
 
 ## 12. Signed claims and trust (`oas/ed25519.py`, `oas/store.py`, `oas/federation.py`)
 

@@ -160,3 +160,53 @@ class TransportCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DaemonTests(unittest.TestCase):
+    def start(self, db, *extra):
+        env = dict(os.environ, PYTHONPATH=ROOT)
+        return subprocess.Popen([sys.executable, "-m", "oas", "--db", db, "daemon", *extra], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env, cwd=ROOT, text=True)
+
+    def test_daemon_runs_due_services_then_stops_after_max_ticks(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "x.db")
+            run_cli(db, "discover", EXAMPLES)
+            p = self.start(db, "--interval", "0.1", "--max-ticks", "3")
+            out, err = p.communicate(timeout=30)
+            self.assertEqual(p.returncode, 0, msg=err)
+            lines = [json.loads(line) for line in out.strip().splitlines()]
+            self.assertEqual(lines[0]["daemon"], "started")
+            self.assertEqual(lines[-1], {"daemon": "stopped", "ticks": 3})
+            ran = [r["service"] for line in lines if "runs" in line for r in line["runs"]]
+            self.assertEqual(ran, ["literature_monitor", "evidence_evaluator", "reporting_service"])   # first tick only
+            self.assertEqual(len(json.loads(run_cli(db, "claims", "--type", "report").stdout)), 1)
+
+    def test_daemon_stops_gracefully_on_sigterm(self):
+        import signal
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "x.db")
+            run_cli(db, "discover", EXAMPLES)
+            p = self.start(db, "--interval", "0.2")
+            first = json.loads(p.stdout.readline())
+            self.assertEqual(first["daemon"], "started")
+            time.sleep(0.6)
+            p.send_signal(signal.SIGTERM)
+            out, err = p.communicate(timeout=15)
+            self.assertEqual(p.returncode, 0, msg=err)
+            self.assertEqual(json.loads(out.strip().splitlines()[-1])["daemon"], "stopped")
+
+    def test_daemon_survives_a_failing_service_and_keeps_ticking(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "x.db")
+            with open(os.path.join(d, "boom.json"), "w") as f:
+                json.dump({"id": "boom", "version": "1", "purpose": "always fails", "entrypoint": "nomod_xyz:fn",
+                           "triggers": [{"kind": "interval", "seconds": 0.1}], "circuit_breaker": 100}, f)
+            run_cli(db, "discover", d)
+            p = self.start(db, "--interval", "0.15", "--max-ticks", "4")
+            out, err = p.communicate(timeout=30)
+            self.assertEqual(p.returncode, 0, msg=err)
+            statuses = [r["status"] for line in map(json.loads, out.strip().splitlines()) if "runs" in line
+                        for r in line["runs"]]
+            self.assertGreaterEqual(len(statuses), 2)
+            self.assertEqual(set(statuses), {"failed"})

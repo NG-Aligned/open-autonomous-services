@@ -73,6 +73,10 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--type", action="append")
     pl.add_argument("--require-signatures", action="store_true")
     pl.add_argument("--require-trusted", action="store_true")
+    dm = sub.add_parser("daemon", help="run the scheduler: call tick() every N seconds until stopped")
+    dm.add_argument("--interval", type=float, default=5.0, help="seconds between ticks (default 5)")
+    dm.add_argument("--max-ticks", type=int, help="stop after N ticks (default: run until SIGINT/SIGTERM)")
+    dm.add_argument("--max-rounds", type=int, default=10)
     sub.add_parser("whoami", help="print this node's id and public signing key")
     tr = sub.add_parser("trust", help="manage trusted signers")
     tsub = tr.add_subparsers(dest="trust_cmd", required=True)
@@ -84,6 +88,37 @@ def build_parser() -> argparse.ArgumentParser:
     trm = tsub.add_parser("remove")
     trm.add_argument("pubkey")
     return p
+
+
+def _daemon(orch: Orchestrator, args: argparse.Namespace) -> int:
+    import signal
+    import time
+
+    stop = {"flag": False}
+
+    def request_stop(signum, frame):  # noqa: ANN001 - signal handler signature
+        stop["flag"] = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    ticks = 0
+    print(json.dumps({"daemon": "started", "interval": args.interval, "node_id": orch.store.node_id}), flush=True)
+    while not stop["flag"] and (args.max_ticks is None or ticks < args.max_ticks):
+        try:
+            res = orch.tick(max_rounds=args.max_rounds)
+            if res.runs or res.truncated:
+                print(json.dumps({"ts": time.time(), "tick": ticks + 1, "truncated": res.truncated,
+                                  "runs": [{"service": r.service_id, "status": r.status, "error": r.error}
+                                           for r in res.runs]}), flush=True)
+        except Exception as exc:  # noqa: BLE001 - a bad tick must not kill the scheduler
+            print(json.dumps({"ts": time.time(), "tick": ticks + 1, "error": f"{type(exc).__name__}: {exc}"}),
+                  flush=True)
+        ticks += 1
+        deadline = time.monotonic() + args.interval
+        while not stop["flag"] and time.monotonic() < deadline and (args.max_ticks is None or ticks < args.max_ticks):
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    print(json.dumps({"daemon": "stopped", "ticks": ticks}), flush=True)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -169,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
             from .transport import pull
             _print(pull(orch, args.url, since=args.since, types=args.type, require_trusted=args.require_trusted,
                         require_signatures=args.require_signatures))
+        elif args.cmd == "daemon":
+            return _daemon(orch, args)
         elif args.cmd == "whoami":
             _print({"node_id": store.node_id, "public_key": store.public_key})
         elif args.cmd == "trust":

@@ -44,6 +44,7 @@ oas --db other.db trust add <pubkey> --label demo --service 'literature_*'
 oas --db other.db import bundle.json --require-trusted    # only accept claims signed by trusted keys
 oas --db demo.db sync ./shared              # or: exchange through a shared directory
 oas --db demo.db prune --keep-runs 50       # retention
+oas --db demo.db daemon --interval 5        # run the scheduler until stopped (SIGINT/SIGTERM)
 ```
 
 Writing a service:

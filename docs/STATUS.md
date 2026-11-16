@@ -15,10 +15,10 @@ Build history
 
 | Check | Result |
 |---|---|
-| Full test suite | **159 tests**, all passing (`python -m unittest discover -s tests`) |
+| Full test suite | **162 tests**, all passing (`python -m unittest discover -s tests`) |
 | Python versions | passes on 3.11, 3.12, 3.13 (Linux). 3.11 runs with 1 test skipped (see below) |
 | Resource hygiene | suite passes with `-W error::ResourceWarning` (no leaked database connections) |
-| Flakiness | concurrency suite passed 15 consecutive runs; isolation suite 12; transport suite 10; full suite 5 |
+| Flakiness | concurrency suite passed 15 consecutive runs; isolation suite 12; transport suite 10 (and 8 more runs after the daemon tests were added); full suite 5 |
 | Coverage | **84%** of statements overall (1,730 statements). The CLI (`cli.py`, `__main__.py`) and the *child half* of `isolation.py` run in subprocesses, so coverage.py does not see them; they are exercised by subprocess tests (`test_cli.py`, `test_isolation.py`, `test_transport.py`). Every other module is 91-100% |
 | Clean install | `pip install .` in a fresh virtualenv; `oas init / discover / tick / lineage / export / import` ran the example pipeline (done for v0.1.0; v0.2.0 commands are covered by the CLI tests) |
 | Ed25519 | matches RFC 8032 test vectors (run on all versions); additionally cross-checked against the `cryptography` package on 25 random keys/messages (ran on 3.12 and 3.13; **skipped on 3.11**, where the system copy of `cryptography` is broken) |
@@ -44,6 +44,8 @@ What each area was tested for (the requirement to test map is in `ARCHITECTURE.m
 - **Transports**: three nodes converge through a shared directory; re-sync is idempotent; bad files are reported
   without blocking good ones; trust policy applies; HTTP pull with `since`/type filters, read-only server
   (405 on writes), non-http URLs refused; CLI serve + pull between processes.
+- **Scheduler daemon** (`oas daemon`): runs due services each tick and stops after `--max-ticks`; stops cleanly on
+  SIGTERM (exit 0); keeps ticking when a service fails.
 - **Retention**: runs, audit, consumed messages and superseded claims pruned; the latest success per service
   and all current claims and unconsumed messages are never deleted; dependency triggers keep working after pruning.
 
@@ -124,8 +126,8 @@ Execution
 - Event delivery is at-least-once. Identical claims (same content, source and timestamp) deduplicate.
 - Cycles are detected and bounded by `max_rounds`, not prevented.
 - Cron: UTC only, 5 fields, numeric values only (no `mon`/`jan` names or `@daily`). Missed slots coalesce into
-  one run. Resolution is one minute and depends on how often something calls `tick()`; the framework does not
-  run its own scheduler loop.
+  one run. Resolution is one minute and depends on the tick interval. `oas daemon` is a simple single-process loop
+  (default every 5 s): no supervision, no restart on crash, no concurrency between services within a tick.
 
 Data model
 - Claim types are plain strings; schemas are an opt-in JSON-Schema *subset* (see `oas/schema.py`), checked only
@@ -148,5 +150,5 @@ Scope
 1. An independent security review of `context.py`, `federation.py`, signing and `isolation.py`.
 2. Key rotation/revocation and encrypted key storage; optional native Ed25519 backend.
 3. Authentication and TLS for the HTTP transport; delta sync between peers; peer discovery.
-4. A built-in scheduler loop (`oas run`) and richer cron (names, time zones).
+4. A supervised/concurrent scheduler and richer cron (names, time zones).
 5. A reference LLM-backed service and a benchmark at millions of claims.
