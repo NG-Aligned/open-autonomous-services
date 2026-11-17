@@ -40,6 +40,11 @@ def matches(patterns: Iterable[str], value: str) -> bool:
     return any(fnmatch.fnmatchcase(value, p) for p in patterns)
 
 
+def can_read(reads: list[str], claim_type: str) -> bool:
+    """Is a claim of this literal type readable under these manifest patterns?"""
+    return claim_type in reads or matches(reads, claim_type)
+
+
 def _is_number(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 

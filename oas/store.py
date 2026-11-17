@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   from_service TEXT NOT NULL, to_service TEXT NOT NULL, topic TEXT NOT NULL,
   payload TEXT NOT NULL, created_at REAL NOT NULL, consumed_at REAL);
+CREATE TABLE IF NOT EXISTS origin_keys(
+  origin TEXT PRIMARY KEY, pubkey TEXT NOT NULL, first_seen REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS trusted_signers(
   pubkey TEXT PRIMARY KEY, label TEXT NOT NULL, services TEXT NOT NULL, added_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS audit(
@@ -92,6 +94,8 @@ def compute_claim_id(
 
 
 SIG_DOMAIN = b"oas-claim/1:"
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_HEX128 = re.compile(r"[0-9a-f]{128}")
 
 
 def signing_message(claim_id: str, origin: str) -> bytes:
@@ -105,10 +109,12 @@ def verify_wire_signature(wire: dict[str, Any]) -> str:
     signer, sig = wire.get("signer"), wire.get("signature")
     if not signer and not sig:
         return "unsigned"
+    if not (isinstance(signer, str) and isinstance(sig, str) and _HEX64.fullmatch(signer) and _HEX128.fullmatch(sig)):
+        return "invalid"          # exactly lowercase hex: no uppercase, whitespace or other malleable spellings
     try:
         ok = ed25519.verify(bytes.fromhex(signer), signing_message(wire["id"], wire["origin"]),
                             bytes.fromhex(sig))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, UnicodeError):
         return "invalid"
     return "valid" if ok else "invalid"
 
@@ -185,6 +191,8 @@ class Store:
                     self._seed = os.urandom(32)
                     self._conn.execute("INSERT INTO meta(key, value) VALUES('signing_seed', ?)", (self._seed.hex(),))
                 self.public_key = ed25519.public_key(self._seed).hex()
+            self._conn.execute("INSERT OR IGNORE INTO origin_keys(origin,pubkey,first_seen) VALUES(?,?,?)",
+                               (self.node_id, self.public_key, self.clock()))
         except BaseException:
             self._conn.close()      # do not leak the connection if construction fails
             raise
@@ -273,6 +281,8 @@ class Store:
         if exclude_local_service is not None:
             sql += " AND NOT (source_service=? AND origin=?)"
             params.extend([exclude_local_service, self.node_id])
+        if limit is not None and limit < 0:
+            raise ValueError("limit must not be negative")
         python_filter = False
         if types:
             clauses: list[str] = []
@@ -299,6 +309,20 @@ class Store:
             return claims[:limit] if limit else claims
         return claims
 
+    def origin_key(self, origin: str) -> str | None:
+        row = self._one("SELECT pubkey FROM origin_keys WHERE origin=?", (origin,))
+        return row["pubkey"] if row else None
+
+    def bind_origin(self, origin: str, pubkey: str) -> None:
+        """Trust-on-first-use: the first valid signer seen for an origin owns it; later keys are rejected on import."""
+        self._run("INSERT OR IGNORE INTO origin_keys(origin,pubkey,first_seen) VALUES(?,?,?)",
+                  (origin, pubkey, self.clock()))
+
+    def upgrade_claim_attribution(self, claim_id: str, origin: str, signer: str, signature: str) -> bool:
+        """Replace an UNSIGNED stored copy's attribution with a verified signed one (never touches signed claims)."""
+        return self._run("UPDATE claims SET origin=?, signer=?, signature=? WHERE id=? AND signature IS NULL",
+                         (origin, signer, signature, claim_id)).rowcount == 1
+
     def sign_claim(self, claim: Claim) -> Claim:
         """Return the claim signed with this node's key (only claims originating here may be signed)."""
         if claim.origin != self.node_id:
@@ -315,6 +339,8 @@ class Store:
     def add_trusted_signer(self, pubkey: str, label: str, services: list[str]) -> None:
         if len(pubkey) != 64 or any(ch not in "0123456789abcdef" for ch in pubkey):
             raise ClaimError("pubkey must be 64 lowercase hex characters")
+        if ed25519.is_small_order(bytes.fromhex(pubkey)):
+            raise ClaimError("pubkey is not a valid, prime-order Ed25519 public key")
         self._run("INSERT INTO trusted_signers(pubkey,label,services,added_at) VALUES(?,?,?,?) "
                   "ON CONFLICT(pubkey) DO UPDATE SET label=excluded.label, services=excluded.services",
                   (pubkey, label, json.dumps(services), self.clock()))
@@ -371,8 +397,8 @@ class Store:
             if row:
                 self._conn.execute(
                     "UPDATE services SET manifest=?, base_dir=?, enabled=1, consecutive_failures=0,"
-                    " disabled_reason=NULL WHERE id=?",
-                    (canonical(manifest), base_dir, manifest["id"]))
+                    " disabled_reason=NULL, registered_at=? WHERE id=?",   # new anchor for first-time cron slots
+                    (canonical(manifest), base_dir, now, manifest["id"]))
             else:
                 self._conn.execute(
                     "INSERT INTO services(id,manifest,base_dir,next_due,registered_at) VALUES(?,?,?,?,?)",

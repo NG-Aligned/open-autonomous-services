@@ -7,6 +7,7 @@ signatures yet, so `source_service` and `origin` are self-asserted.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable
 
@@ -44,16 +45,29 @@ def _validate_shape(w: Any) -> None:
         raise ClaimError("claim is missing required fields")
     if not isinstance(w["inputs"], list) or not all(isinstance(i, str) for i in w["inputs"]):
         raise ClaimError("inputs must be a list of ids")
-    if isinstance(w["confidence"], bool) or not isinstance(w["confidence"], (int, float)) \
-            or not 0.0 <= w["confidence"] <= 1.0:
+    for k in ("confidence", "created_at"):
+        v = w[k]
+        # Ids hash the canonical JSON, where 1 and 1.0 differ; requiring floats keeps relayed claims verifiable.
+        if isinstance(v, bool) or not isinstance(v, float) or not math.isfinite(v):
+            raise ClaimError(f"{k} must be a finite JSON float (write 1.0, not 1)")
+    if not 0.0 <= w["confidence"] <= 1.0:
         raise ClaimError("confidence out of range")
-    if not isinstance(w["created_at"], (int, float)):
-        raise ClaimError("created_at must be a number")
     for k in ("id", "type", "source_service", "origin"):
         if not isinstance(w[k], str) or not w[k]:
             raise ClaimError(f"{k} must be a non-empty string")
+    for k in ("signer", "signature"):
+        if w.get(k) is not None and not isinstance(w[k], str):
+            raise ClaimError(f"{k} must be a string or null")
     if w["supersedes"] is not None and not isinstance(w["supersedes"], str):
         raise ClaimError("supersedes must be a string or null")
+    for text in (w["id"], w["type"], w["source_service"], w["origin"], *w["inputs"], w["supersedes"] or "",
+                 w.get("signer") or "", w.get("signature") or ""):
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ClaimError("text fields must be valid Unicode (no lone surrogates)") from None
+    if "\x00" in w["type"] or "\x00" in w["source_service"] or "\x00" in w["origin"]:
+        raise ClaimError("type, source_service and origin must not contain NUL")
 
 
 def import_bundle(store: Store, bundle: dict[str, Any], *,
@@ -77,16 +91,39 @@ def import_bundle(store: Store, bundle: dict[str, Any], *,
     imported = duplicates = 0
     rejected: list[dict[str, str]] = []
     with store.transaction():
-        imported, duplicates = _import_claims(store, claims, rejected, schema_lookup, trusted, require_signatures)
+        imported, duplicates, upgraded = _import_claims(store, claims, rejected, schema_lookup, trusted,
+                                                        require_signatures)
     store.audit(None, "import_bundle",
-                f"from {bundle.get('node_id')}: {imported} imported, {duplicates} duplicate, {len(rejected)} rejected",
-                True)
-    return {"imported": imported, "duplicates": duplicates, "rejected": rejected}
+                f"from {bundle.get('node_id')}: {imported} imported, {duplicates} duplicate "
+                f"({upgraded} upgraded to a signed copy), {len(rejected)} rejected", True)
+    return {"imported": imported, "duplicates": duplicates, "upgraded": upgraded, "rejected": rejected}
+
+
+def _check_signature_policy(store: Store, w: dict[str, Any], trusted: dict[str, dict[str, Any]] | None,
+                            require_signatures: bool) -> str:
+    """Signature, origin-binding and trusted-signer checks. Returns 'valid' or 'unsigned'; raises ClaimError."""
+    status = verify_wire_signature(w)
+    if status == "invalid":
+        raise ClaimError("signature does not verify (forged or altered claim/origin)")
+    if status == "unsigned":
+        if require_signatures or trusted is not None:
+            raise ClaimError("claim is unsigned but signatures are required")
+        return status
+    bound = store.origin_key(w["origin"])
+    if bound is not None and bound != w["signer"]:
+        raise ClaimError(f"origin '{w['origin']}' is bound to a different signing key")
+    if trusted is not None:
+        entry = trusted.get(w["signer"])
+        if entry is None:
+            raise ClaimError(f"signer {w['signer'][:12]} is not trusted")
+        if not matches(entry["services"], w["source_service"]):
+            raise ClaimError(f"signer {w['signer'][:12]} is not trusted for service '{w['source_service']}'")
+    return status
 
 
 def _import_claims(store: Store, claims: list[Any], rejected: list[dict[str, str]],
-                   schema_lookup, trusted, require_signatures) -> tuple[int, int]:
-    imported = duplicates = 0
+                   schema_lookup, trusted, require_signatures) -> tuple[int, int, int]:
+    imported = duplicates = upgraded = 0
     for w in claims:
         cid = w.get("id", "?") if isinstance(w, dict) else "?"
         try:
@@ -95,20 +132,21 @@ def _import_claims(store: Store, claims: list[Any], rejected: list[dict[str, str
                                         w["confidence"], w["created_at"], w["supersedes"])
             if expected != w["id"]:
                 raise ClaimError("id does not match content (tampered or corrupted)")
-            if store.get_claim(w["id"]) is not None:
+            existing = store.get_claim(w["id"])
+            if existing is not None:
                 duplicates += 1
+                # origin is not part of the id, so an unsigned copy with a forged origin could otherwise pin the
+                # claim forever: a verified signed copy replaces the attribution of an unsigned one.
+                if existing.signature is None and existing.origin != store.node_id and w.get("signature"):
+                    try:
+                        ok = _check_signature_policy(store, w, trusted, require_signatures) == "valid"
+                    except ClaimError:
+                        ok = False
+                    if ok and store.upgrade_claim_attribution(w["id"], w["origin"], w["signer"], w["signature"]):
+                        store.bind_origin(w["origin"], w["signer"])
+                        upgraded += 1
                 continue
-            status = verify_wire_signature(w)
-            if status == "invalid":
-                raise ClaimError("signature does not verify (forged or altered claim/origin)")
-            if status == "unsigned" and (require_signatures or trusted is not None):
-                raise ClaimError("claim is unsigned but signatures are required")
-            if trusted is not None:
-                entry = trusted.get(w["signer"])
-                if entry is None:
-                    raise ClaimError(f"signer {w['signer'][:12]} is not trusted")
-                if not matches(entry["services"], w["source_service"]):
-                    raise ClaimError(f"signer {w['signer'][:12]} is not trusted for service '{w['source_service']}'")
+            status = _check_signature_policy(store, w, trusted, require_signatures)
             if schema_lookup is not None:
                 for sch in schema_lookup(w["type"]):
                     problems = _schema.validate(w["content"], sch)
@@ -130,6 +168,10 @@ def _import_claims(store: Store, claims: list[Any], rejected: list[dict[str, str
                           signer=w.get("signer"), signature=w.get("signature"))
             if store.insert_claim(claim):
                 imported += 1
+                if status == "valid":
+                    store.bind_origin(w["origin"], w["signer"])
         except ClaimError as exc:
             rejected.append({"id": str(cid), "reason": str(exc)})
-    return imported, duplicates
+        except (OverflowError, UnicodeError, ValueError, TypeError, KeyError) as exc:   # hostile values: reject one claim
+            rejected.append({"id": str(cid), "reason": f"malformed claim ({type(exc).__name__}: {exc})"})
+    return imported, duplicates, upgraded

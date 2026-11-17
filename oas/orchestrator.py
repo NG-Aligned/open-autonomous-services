@@ -20,10 +20,10 @@ from .context import ServiceContext
 from .errors import (ManifestError, ServiceDisabled, ServiceNotBound, ServiceNotFound,
                      ServiceTimeout)
 from . import cron as _cron
-from .isolation import run_in_process
+from .isolation import DEFAULT_TIMEOUT, run_in_process
 from .federation import import_bundle as _import_bundle
 from .graph import build_edges, find_cycles, topo_order, types_overlap
-from .manifest import Manifest, load_manifest, matches
+from .manifest import Manifest, can_read, load_manifest, matches
 from .store import Store
 
 ServiceFn = Callable[[ServiceContext], None]
@@ -235,7 +235,7 @@ class Orchestrator:
                 new = [c for c in new if c.seq is not None and c.seq <= snapshot]
                 if new:
                     reasons.append({"kind": "event", "claim_type": t["claim_type"], "count": len(new),
-                                    "claim_ids": [c.id for c in new[:5]]})
+                                    "claim_ids": [c.id for c in new if can_read(m.reads, c.type)][:5]})
                     updates[key] = snapshot
             elif kind == "dependency":
                 key = f"dep:{t['service']}"
@@ -325,7 +325,8 @@ class Orchestrator:
                 state = {} if manifest.continuity == "ephemeral" else self.store.get_state(service_id)
                 ctx = ServiceContext(self.store, manifest, config, json.loads(json.dumps(state)), reasons, run_id)
                 if manifest.isolation == "process":
-                    run_in_process(ctx, manifest.entrypoint, svc["base_dir"], manifest.timeout_seconds,
+                    run_in_process(ctx, manifest.entrypoint, svc["base_dir"],
+                                   manifest.timeout_seconds if manifest.timeout_seconds is not None else DEFAULT_TIMEOUT,
                                    manifest.max_memory_mb)
                 else:
                     fn = self._resolve_fn(service_id, manifest, svc["base_dir"])

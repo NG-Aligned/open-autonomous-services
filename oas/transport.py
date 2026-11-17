@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import stat
 import tempfile
 import threading
 import urllib.parse
@@ -50,10 +52,17 @@ def sync_dir(orch, directory: str | Path, *, require_trusted: bool = False,
         if p.name == target.name:
             continue
         try:
+            st = p.stat()
+            if not stat.S_ISREG(st.st_mode):
+                raise OASError("not a regular file")       # FIFOs/devices/directories could hang or exhaust us
+            if st.st_size > MAX_PULL_BYTES:
+                raise OASError("bundle file exceeds the maximum accepted size")
             other = json.loads(p.read_text(encoding="utf-8"))
             imported[p.name] = orch.import_bundle(other, require_trusted=require_trusted,
                                                   require_signatures=require_signatures)
-        except (OSError, ValueError, OASError, RecursionError) as exc:   # one bad file must not stop the others
+        except sqlite3.Error:
+            raise                                          # a storage fault is not a bad peer file
+        except Exception as exc:                          # noqa: BLE001 - one bad file must not stop the others
             imported[p.name] = {"error": f"{type(exc).__name__}: {exc}"}
     return {"published": str(target), "claims_published": len(bundle["claims"]), "imported": imported}
 
@@ -106,13 +115,21 @@ def serve_in_thread(store: Store, host: str = "127.0.0.1", port: int = 0) -> tup
     return server, t
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:   # a peer must not bounce us to other hosts/schemes
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def pull(orch, url: str, *, since: int = 0, types: list[str] | None = None, timeout: float = 30.0,
          require_trusted: bool = False, require_signatures: bool = False) -> dict[str, Any]:
     """Fetch /bundle from another node and import it."""
     if urllib.parse.urlparse(url).scheme not in ("http", "https"):
         raise OASError("pull URL must start with http:// or https://")
     q = urllib.parse.urlencode([("since", since), *[("type", t) for t in (types or [])]])
-    with urllib.request.urlopen(url.rstrip("/") + "/bundle?" + q, timeout=timeout) as resp:   # noqa: S310 - scheme checked
+    with _OPENER.open(url.rstrip("/") + "/bundle?" + q, timeout=timeout) as resp:   # noqa: S310 - scheme checked
         data = resp.read(MAX_PULL_BYTES + 1)
     if len(data) > MAX_PULL_BYTES:
         raise OASError("bundle exceeds the maximum accepted size")

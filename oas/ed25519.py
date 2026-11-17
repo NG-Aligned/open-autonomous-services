@@ -112,6 +112,12 @@ def sign(seed: bytes, message: bytes) -> bytes:
     return R + int.to_bytes(s, 32, "little")
 
 
+def is_small_order(pub: bytes) -> bool:
+    """True for public keys of order dividing 8 (e.g. the identity), or that are not valid points."""
+    A = _decompress(pub)
+    return A is None or _eq(_mul(8, A), _IDENT)
+
+
 def verify(pub: bytes, message: bytes, signature: bytes) -> bool:
     try:
         if len(pub) != 32 or len(signature) != 64:
@@ -119,6 +125,8 @@ def verify(pub: bytes, message: bytes, signature: bytes) -> bool:
         A = _decompress(pub)
         R = _decompress(signature[:32])
         if A is None or R is None:
+            return False
+        if _eq(_mul(8, A), _IDENT):      # stricter than RFC 8032: small-order keys admit universal forgeries
             return False
         s = int.from_bytes(signature[32:], "little")
         if s >= L:

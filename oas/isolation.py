@@ -31,6 +31,7 @@ from .store import Claim
 
 _RPC = {"read", "get_claim", "write", "send", "inbox", "log", "now"}
 MAX_LINE = 64 * 1024 * 1024
+DEFAULT_TIMEOUT = 300.0   # isolated services always have a bound, so a hostile child cannot hang the parent forever
 
 
 def _claim_to_json(c: Claim) -> dict[str, Any]:
@@ -52,9 +53,23 @@ class _Channel:
     def __init__(self, sock: socket.socket) -> None:
         self.sock = sock
         self.buf = b""
+        self.deadline: float | None = None     # set by the parent; sends must not outlive it
 
     def send(self, obj: Any) -> None:
-        self.sock.sendall(json.dumps(obj, allow_nan=False).encode("utf-8") + b"\n")
+        data = json.dumps(obj, allow_nan=False).encode("utf-8") + b"\n"
+        if self.deadline is None:
+            self.sock.sendall(data)
+            return
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ServiceTimeout("process exceeded its timeout and was killed")
+        self.sock.settimeout(remaining)           # a child that stops reading must not block the parent in sendall
+        try:
+            self.sock.sendall(data)
+        except TimeoutError:
+            raise ServiceTimeout("process exceeded its timeout and was killed") from None
+        finally:
+            self.sock.settimeout(None)
 
     def recv(self, deadline: float | None, proc: subprocess.Popen) -> Any:
         """Return the next message, or None if the child closed the channel. Raises ServiceTimeout at deadline."""
@@ -92,6 +107,7 @@ def run_in_process(ctx: ServiceContext, entrypoint: str, base_dir: str | None, t
     child_sock.close()
     chan = _Channel(parent_sock)
     deadline = None if timeout is None else time.monotonic() + timeout
+    chan.deadline = deadline
     try:
         chan.send({"init": {"entrypoint": entrypoint, "base_dir": base_dir, "service_id": ctx.service_id,
                             "config": ctx.config, "state": ctx.state, "trigger": ctx.trigger,

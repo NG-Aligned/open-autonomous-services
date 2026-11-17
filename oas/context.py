@@ -9,7 +9,7 @@ import json
 from typing import Any, Iterable
 
 from .errors import ClaimError, MessageError, PermissionDenied, ServiceCancelled
-from .manifest import Manifest, has_wildcard, matches
+from .manifest import Manifest, can_read, has_wildcard, matches
 from . import schema as _schema
 from .store import Claim, Store, compute_claim_id
 
@@ -50,8 +50,7 @@ class ServiceContext:
         raise PermissionDenied(f"{self.service_id}: {action} denied ({detail})")
 
     def _can_read(self, claim_type: str) -> bool:
-        reads = self._manifest.reads
-        return claim_type in reads or matches(reads, claim_type)
+        return can_read(self._manifest.reads, claim_type)
 
     def _lookup(self, claim_id: str) -> Claim | None:
         return self._pending_by_id.get(claim_id) or self._store.get_claim(claim_id)
@@ -70,8 +69,16 @@ class ServiceContext:
         self._guard()
         if not self._can_read(claim_type):
             self._deny("read", claim_type)
-        return self._store.query_claims([claim_type], current_only=current_only, after_seq=after_seq,
-                                        limit=limit, source_service=source_service)
+        # The requested string is used as a *pattern* by the query, so passing the permission check on the string
+        # is not enough (reads ["x?"] would admit the pattern "x*"). Every returned claim must itself be readable.
+        wild = has_wildcard(claim_type)
+        claims = self._store.query_claims([claim_type], current_only=current_only, after_seq=after_seq,
+                                          limit=None if wild else limit, source_service=source_service)
+        if wild:
+            claims = [c for c in claims if self._can_read(c.type)]
+            if limit:
+                claims = claims[:limit]
+        return claims
 
     def get_claim(self, claim_id: str) -> Claim | None:
         self._guard()
@@ -84,7 +91,7 @@ class ServiceContext:
               inputs: Iterable[str] = (), supersedes: str | None = None) -> str:
         """Buffer a claim. Returns its content-addressed id."""
         self._guard()
-        if not claim_type or has_wildcard(claim_type):
+        if not claim_type or has_wildcard(claim_type) or "\x00" in claim_type:
             raise ClaimError("claim type must be a non-empty literal (no wildcards)")
         if not matches(self._manifest.writes, claim_type):
             self._deny("write", claim_type)

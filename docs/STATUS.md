@@ -7,7 +7,7 @@ the build environment (Linux, one machine) and are quoted as measured.
 Build history
 - **v0.1.0**, 2026-11-15 23:35-23:59 UTC (about 24 minutes of the 60-minute budget): core framework.
 - **v0.2.0**, 2026-11-16 (the remaining budget): claim schemas, signed claims, process isolation, cron schedules,
-  transports, retention, query optimisation, and a self-review that found and fixed four defects (below).
+  transports, retention, query optimisation, and a self-review that found and fixed four defects (below), then an independent model review (below).
 - The repository was published only after v0.1.0 was built, because the build session had no write access to the
   GitHub organisation until the Claude GitHub App was installed.
 
@@ -15,10 +15,10 @@ Build history
 
 | Check | Result |
 |---|---|
-| Full test suite | **163 tests**, all passing (`python -m unittest discover -s tests`) |
+| Full test suite | **181 tests**, all passing (`python -m unittest discover -s tests`) |
 | Python versions | passes on 3.11, 3.12, 3.13 (Linux). 3.11 runs with 1 test skipped (see below) |
 | Resource hygiene | suite passes with `-W error::ResourceWarning` (no leaked database connections) |
-| Flakiness | concurrency suite passed 15 consecutive runs; isolation suite 12; transport suite 10 (and 8 more runs after the daemon tests were added); full suite 5 |
+| Flakiness | concurrency suite passed 15 consecutive runs; isolation suite 12; transport suite 10 (and 8 more runs after the daemon tests were added); full suite 5, then 6 more runs on each of 3.11/3.12/3.13 after the review fixes (18 of 18 passed) |
 | Coverage | **84%** of statements overall (1,730 statements). The CLI (`cli.py`, `__main__.py`) and the *child half* of `isolation.py` run in subprocesses, so coverage.py does not see them; they are exercised by subprocess tests (`test_cli.py`, `test_isolation.py`, `test_transport.py`). Every other module is 91-100% |
 | Clean install | `pip install .` in a fresh virtualenv; `oas init / discover / tick / lineage / export / import` ran the example pipeline (done for v0.1.0; v0.2.0 commands are covered by the CLI tests) |
 | Ed25519 | matches RFC 8032 test vectors (run on all versions); additionally cross-checked against the `cryptography` package on 25 random keys/messages (ran on 3.12 and 3.13; **skipped on 3.11**, where the system copy of `cryptography` is broken) |
@@ -70,10 +70,49 @@ Each was reproduced with a script before being fixed and now has a regression te
 A performance regression introduced by fix 1 (queries 100x slower, caught by re-running the benchmark) was found
 and fixed in the same session; a test now guards the query plan.
 
-**Not done: an independent review.** A fresh reviewing agent was started to audit this code but failed immediately
-with an API rate-limit error, so no independent review took place. The self-review above is the author reviewing
-their own work, and was necessarily limited to what I thought to probe. Treat the security-relevant modules
-(`context.py`, `federation.py`, `store.py` signing, `isolation.py`) as unaudited.
+## Independent review (a model instance, not a human audit) and its findings
+
+A separate Claude instance, given only the published code at commit 9401f01 and no knowledge of my reasoning,
+was asked to attack it. The first two attempts failed with API rate limits; the third succeeded. **Caveat: this
+was another instance of the same kind of model, not a professional security audit. It found real defects, which
+is evidence the review was useful and not evidence that nothing remains.** Treat the security-relevant modules
+as still not professionally audited.
+
+Each finding below was reproduced against the published code, fixed, and now has a regression test
+(`tests/test_review2.py`, `tests/iso_flood.py`).
+
+1. **Wildcard-read permission bypass (high).** A manifest with `reads: ["x?"]` could call `read("x*")`: the
+   literal string passed the permission check, then acted as a pattern and returned types it was not allowed to
+   see. Fixed: wildcard reads are filtered per returned claim (limit applied after filtering); trigger info no
+   longer lists ids of unreadable types.
+2. **One hostile claim aborted an entire import/sync** (huge ints, lone surrogates, NUL bytes). Fixed: rejected
+   per claim; good claims in the same bundle still import.
+3. **Integer `confidence`/`created_at` on the wire** broke id verification for relayed claims. Fixed: they must
+   be JSON floats (`1.0`, not `1`).
+4. **Origin hijack by a trusted key (medium).** `origin` is not part of the id, so any trusted signer could sign
+   claims in another node's name. Fixed with trust-on-first-use origin-to-key binding: once an origin has been
+   seen with a valid signature, only that key may sign for it.
+5. **Isolation hang.** A child that stopped reading could block the parent in `sendall` past the timeout.
+   Fixed: sends honour the deadline, and isolated services without `timeout_seconds` get a 300 s default.
+6. **FIFO in a sync directory hung `sync_dir`.** Fixed: non-regular files are skipped with an error entry.
+7. **Small-order Ed25519 keys** allowed universal signature forgery, and non-canonical (uppercase) hex was
+   accepted. Fixed: such keys are rejected at verify time and cannot be added as trusted signers; only
+   canonical lowercase hex is "valid".
+8. **NUL in claim types; negative `limit`** broke the SQL pushdown. Fixed: rejected.
+9. **Cron re-registration** with a new expression fired a stale slot immediately. Fixed.
+10. Related: an unsigned copy with a forged origin could pin a claim's attribution. Fixed: a verified signed
+    copy upgrades the attribution; signed claims are never overwritten.
+11. `pull` refuses HTTP redirects (confirmed by test).
+
+**Reported but not fixed (documented limitations):**
+- **Prune then sync resurrects pruned claims** and re-fires their event triggers, because a peer still holds them.
+- **Supersede existence oracle:** denial messages for supersession reveal whether a claim id exists and its type.
+- **Origin squatting:** trust-on-first-use means the first signer to present an origin owns it on that node. With
+  `--require-trusted` only trusted keys can bind, which is the mitigation.
+- **Unverified suspicions** (not reproduced, so not claimed as bugs): `pull` has per-socket-operation rather than
+  total timeouts (a slow-drip peer may stretch it); a directory named like a bundle file may break `os.replace`;
+  retry back-off sleeps while holding the lease; copying a database file duplicates its node id and signing key.
+- Re-registering a service resets its cron anchor.
 
 ## Measured performance (`python benchmarks/bench.py 20000`)
 

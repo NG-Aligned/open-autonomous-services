@@ -192,3 +192,18 @@ automatically (`oas prune ...`).
 - **Swap an implementation:** re-register the same `id` with a new version/function. State, claims and
   history are kept; the other services are unaffected (`test_pipeline.py::test_replacing_a_service…`).
 - **Add a node:** point another process/machine at its own database and exchange bundles.
+
+## 17. Review-driven rules (added after the independent review)
+
+- **Origin binding (TOFU).** `origin` is not in the claim id, so the store keeps an `origin_keys` table: the first
+  valid signature seen for an origin binds it to that signer; later signatures from other keys for that origin are
+  rejected on import. A verified signed copy upgrades an unsigned copy's attribution; signed claims are never
+  overwritten. The first signer to present an origin owns it locally (use `--require-trusted` to restrict who can).
+- **Wire numbers.** `confidence` and `created_at` must be JSON floats, because `1` and `1.0` hash differently.
+- **Wildcard reads** are permission-checked per returned claim; `limit` is applied after that filter. Negative
+  limits raise `ValueError`; NUL is rejected in types, service names and origins.
+- **Ed25519 strictness.** Small-order keys fail verification and cannot be trusted; signatures must be canonical
+  lowercase hex.
+- **Isolation bound.** Isolated services always run under a deadline (default 300 s) that also covers sends.
+- **Sync directories** only read regular files; each file and each claim is contained so one bad input cannot
+  abort the rest.
